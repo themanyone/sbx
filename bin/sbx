@@ -1,0 +1,451 @@
+#!/usr/bin/env bash
+# sbx - run a command inside an ephemeral bubblewrap sandbox.
+#
+# The only writable host path is the project directory. Everything else the
+# sandbox writes goes to tmpfs and is discarded when the command exits.
+#
+# There is no unsandboxed fallback. If the sandbox cannot be constructed,
+# this script fails.
+
+set -euo pipefail
+
+SBX_CONF="${SBX_CONF:-$HOME/.config/sbx/sbx.conf}"
+BWRAP="${BWRAP:-bwrap}"
+
+die() { printf 'sbx: %s\n' "$*" >&2; exit 2; }
+warn() { printf 'sbx: warning: %s\n' "$*" >&2; }
+
+# The agent profile is opt-in but is meant to be easy to reach, so it is
+# available as a flag rather than only as an SBX_CONF path. It mounts the
+# default spec plus Crush's own config, which is what lets Crush authenticate
+# and see its skills.
+AGENT_PROFILE=0
+
+# Set by cmd_shell. Suppresses --new-session so the interactive shell keeps job
+# control; see build_argv for why the two cases differ.
+INTERACTIVE=0
+
+# Files the agent profile mounts read-only. Crush reads its provider list from
+# the config dir's crush.json and its skills from the config dir; both are read,
+# not written, so read-only is enough for them.
+#
+# The data dir is deliberately absent here: it is mounted via the writable
+# session copy instead, because Crush rewrites it while running. Listing its
+# files here as well would mount them read-only over the copy and reintroduce
+# the "device or resource busy" failure.
+AGENT_RO_FILE=(
+  "$HOME/.config/crush/crush.json"
+)
+AGENT_RO_DIR=("$HOME/.config/crush/skills")
+
+# Crush rewrites its own data dir as it runs (model selection, session state,
+# and the locks it takes while doing so). Mounting that directory read-only
+# makes it fail with "device or resource busy" on the first write, so the
+# profile instead copies it into a session temp directory and binds that
+# writable. AGENT_DATA_TMP is that copy, and AGENT_DATA_HOME is the path Crush
+# must be told to use; see prepare_agent_data.
+AGENT_DATA_TMP=""
+AGENT_DATA_HOME=""
+
+# ---------------------------------------------------------------- config
+
+declare -a RO_BIND=() RW_BIND=() RO_FILE=() RO_DIR=() HIDE=() ENVX=()
+UNSHARE_PID=on
+UNSHARE_IPC=on
+UNSHARE_UTS=on
+NETWORK=on
+
+# Expand a leading ~ or ~/ to $HOME. Config values are read with `read`, which
+# performs no expansion, and bwrap does not expand ~ either, so without this a
+# line like `ro_file = ~/.config/crush/crush.json` is silently skipped as
+# absent. Only a bare leading ~ is expanded; ~user is left alone.
+expand_home() {
+  case "$1" in
+    '~')    printf '%s' "$HOME" ;;
+    '~/'*)  printf '%s' "$HOME/${1#\~/}" ;;
+    *)      printf '%s' "$1" ;;
+  esac
+}
+
+# Remove session copies left by a previous run. cmd_run cleans up after itself,
+# but a SIGKILL cannot run any handler, and these copies hold live API keys, so
+# sweep stale ones at startup rather than leave them in /tmp forever. Anything
+# older than a day is certainly abandoned.
+sweep_stale_agent_data() {
+  find /tmp -maxdepth 1 -name 'sbx-agent-data.*' -type d -mtime +0 -exec rm -rf {} + 2>/dev/null
+  return 0
+}
+
+# Copy Crush's data dir into a temp tree and remember where it is. Crush writes
+# this directory while running, so it cannot be mounted read-only, and mounting
+# the host directory writable would let a sandboxed agent edit the host's real
+# model selection and credentials. The copy is discarded on exit, which matches
+# the sandbox's existing promise that only the project directory persists.
+prepare_agent_data() {
+  [[ $AGENT_PROFILE == 1 ]] || return 0
+  local src="$HOME/.local/share/crush"
+  [[ -d $src ]] || return 0
+  # The temp tree mirrors the host layout: $XDG_DATA_HOME/crush/. Crush resolves
+  # its data dir from XDG_DATA_HOME, so the copy has to keep that extra level.
+  AGENT_DATA_TMP="$(mktemp -d /tmp/sbx-agent-data.XXXXXX)"
+  mkdir -p "$AGENT_DATA_TMP/crush"
+  # cp -a keeps modes; the files are 0600 and the copy stays private.
+  cp -a "$src/." "$AGENT_DATA_TMP/crush/" || die "cannot copy crush data dir: $src"
+  # Drop stale lock files. They name PIDs from the host, and the sandbox has its
+  # own pid namespace, so a leftover lock can look held forever.
+  rm -f "$AGENT_DATA_TMP/crush"/*.lock
+  rm -rf "$AGENT_DATA_TMP/crush/locks"
+  AGENT_DATA_HOME="$AGENT_DATA_TMP"
+}
+
+# Validate an on/off toggle and normalise it case-insensitively into REPLY.
+# Accepting only these two spellings keeps a typo from failing open, which is
+# the same reason unknown keys are fatal.
+parse_toggle() {
+  local file="$1" lineno="$2" key="$3" val="$4"
+  case "${val,,}" in
+    on)  REPLY=on ;;
+    off) REPLY=off ;;
+    *)   die "$file:$lineno: $key must be 'on' or 'off', got '$val'" ;;
+  esac
+}
+
+parse_conf() {
+  local file="$1" lineno=0 key val
+  local -a _tmp=()
+  [[ -f $file ]] || die "config not found: $file"
+  while IFS= read -r line || [[ -n $line ]]; do
+    lineno=$((lineno + 1))
+    line="${line%%#*}"
+    [[ -z ${line//[[:space:]]/} ]] && continue
+    [[ $line == *=* ]] || die "$file:$lineno: not a key=value line: $line"
+    key="${line%%=*}"; val="${line#*=}"
+    key="${key//[[:space:]]/}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    local -a _words=()
+    read -r -a _words <<<"$val" || _words=()
+    local i
+    for ((i = 0; i < ${#_words[@]}; i++)); do
+      _words[i]="$(expand_home "${_words[i]}")"
+    done
+    val="${_words[*]}"
+    case "$key" in
+      ro_bind)      read -r -a RO_BIND <<<"$val" || RO_BIND=() ;;
+      # Repeatable keys append, so a key may appear on several lines. An empty
+      # value is legal and means "no entries". Every branch must end in a
+      # command that returns 0: an empty value makes the [[ -n ]] test fail,
+      # and under `set -e` a nonzero return from the last command of the loop
+      # body becomes parse_conf's exit status and aborts the whole script.
+      rw_bind)      if [[ -n $val ]]; then read -r -a _tmp <<<"$val"; RW_BIND+=("${_tmp[@]}"); fi ;;
+      ro_file)      if [[ -n $val ]]; then read -r -a _tmp <<<"$val"; RO_FILE+=("${_tmp[@]}"); fi ;;
+      ro_dir)       if [[ -n $val ]]; then read -r -a _tmp <<<"$val"; RO_DIR+=("${_tmp[@]}"); fi ;;
+      hide)         if [[ -n $val ]]; then read -r -a _tmp <<<"$val"; HIDE+=("${_tmp[@]}"); fi ;;
+      env)          if [[ -n $val ]]; then read -r -a _tmp <<<"$val"; ENVX+=("${_tmp[@]}"); fi ;;
+      # Toggles accept only on/off. Anything else is a hard error: a typo like
+      # `network = Off` would otherwise compare unequal to "off" and silently
+      # leave the namespace shared, failing open. Same reasoning as the unknown
+      # key rule above.
+      unshare_pid)  parse_toggle "$file" "$lineno" "$key" "$val"; UNSHARE_PID="$REPLY" ;;
+      unshare_ipc)  parse_toggle "$file" "$lineno" "$key" "$val"; UNSHARE_IPC="$REPLY" ;;
+      unshare_uts)  parse_toggle "$file" "$lineno" "$key" "$val"; UNSHARE_UTS="$REPLY" ;;
+      network)      parse_toggle "$file" "$lineno" "$key" "$val"; NETWORK="$REPLY" ;;
+      *)            die "$file:$lineno: unknown key '$key'" ;;
+    esac
+  done <"$file"
+}
+
+# ---------------------------------------------------------------- plumbing
+
+# Emits the bwrap argv, one argument per line, then a marker.
+build_argv() {
+  local project="$1"; shift
+  local p
+
+  printf '%s\n' "$BWRAP"
+
+  for p in "${RO_BIND[@]}"; do
+    if [[ -e $p ]]; then
+      printf -- '--ro-bind\n%s\n%s\n' "$p" "$p"
+    else
+      warn "ro_bind path absent, skipping: $p" >&2
+    fi
+  done
+
+  # Fedora is usrmerged: /bin, /lib, /lib64 and /sbin are symlinks into /usr.
+  # Recreate them, or nothing is executable inside the sandbox.
+  printf -- '--symlink\nusr/bin\n/bin\n'
+  printf -- '--symlink\nusr/sbin\n/sbin\n'
+  printf -- '--symlink\nusr/lib\n/lib\n'
+  printf -- '--symlink\nusr/lib64\n/lib64\n'
+
+  # Read-only single files. The parent directory is created as an empty dir
+  # first, so the file can be mounted without exposing its siblings.
+  local f
+  for f in "${RO_FILE[@]}"; do
+    [[ -f $f ]] || { warn "ro_file absent, skipping: $f"; continue; }
+    printf -- '--dir\n%s\n' "$(dirname "$f")"
+    printf -- '--ro-bind\n%s\n%s\n' "$f" "$f"
+  done
+
+  # Hide the host home tree before any project bind so that only the named
+  # project directory is reachable underneath it.
+  printf -- '--tmpfs\n%s\n' "$HOME"
+
+  # Read-only single files again, now that the home tmpfs exists, so the
+  # empty parent directories created above survive.
+  for f in "${RO_FILE[@]}"; do
+    [[ -f $f ]] || continue
+    printf -- '--dir\n%s\n' "$(dirname "$f")"
+    printf -- '--ro-bind\n%s\n%s\n' "$f" "$f"
+  done
+
+  # Read-only directories, for trees that must be visible in full (Crush's
+  # skills/). These must come after the home tmpfs for the same reason as
+  # ro_file: anything bound before it under $HOME is erased. Unlike ro_file,
+  # the whole subtree is exposed, so only point this at content that is
+  # already safe to hand to the sandboxed command.
+  local d
+  for d in "${RO_DIR[@]}"; do
+    [[ -d $d ]] || { warn "ro_dir absent, skipping: $d"; continue; }
+    printf -- '--dir\n%s\n' "$(dirname "$d")"
+    printf -- '--ro-bind\n%s\n%s\n' "$d" "$d"
+  done
+
+  for p in "${RW_BIND[@]}"; do
+    printf -- '--bind\n%s\n%s\n' "$p" "$p"
+  done
+
+  # Writable-but-discarded areas. /var subpaths are tmpfs so package
+  # managers can operate without touching the host.
+  for p in /tmp /var/tmp /var/cache /var/log /run; do
+    printf -- '--tmpfs\n%s\n' "$p"
+  done
+
+  for p in "${HIDE[@]}"; do
+    printf -- '--tmpfs\n%s\n' "$p"
+  done
+
+  # The host /etc/resolv.conf points at systemd-resolved's stub on 127.0.0.53,
+  # which listens on host loopback and is unreachable here. /etc/resolv.conf is
+  # a symlink into /run, so recreate the target directory and bind the real
+  # upstream resolver file at its final path. Must come after the /run tmpfs,
+  # which would otherwise wipe it.
+  if [[ -n ${RESOLV_TMP:-} && -r ${RESOLV_TMP:-} ]]; then
+    printf -- '--dir\n/run/systemd/resolve\n'
+    printf -- '--ro-bind\n%s\n/run/systemd/resolve/stub-resolv.conf\n' "$RESOLV_TMP"
+  fi
+
+  # The project bind comes last so it lands on top of the scrubbed home.
+  printf -- '--bind\n%s\n%s\n' "$project" "$project"
+
+  # A writable session copy of Crush's data dir. Bound after the project so it
+  # wins if the project happens to sit at the same path, which it cannot in
+  # practice because the copy lives under /tmp.
+  if [[ -n ${AGENT_DATA_TMP:-} && -d ${AGENT_DATA_TMP:-} ]]; then
+    printf -- '--bind\n%s\n%s\n' "$AGENT_DATA_TMP" "$AGENT_DATA_TMP"
+  fi
+
+  printf -- '--proc\n/proc\n--dev\n/dev\n'
+  printf -- '--chdir\n%s\n' "$project"
+  printf -- '--setenv\nHOME\n%s\n' "$HOME"
+  printf -- '--setenv\nPATH\n%s\n' "$PATH"
+
+  # Point Crush at the writable copy. XDG_DATA_HOME selects the *parent* of the
+  # crush/ directory, matching how the host lays it out, so Crush resolves
+  # $XDG_DATA_HOME/crush/crush.json to the temp copy rather than the read-only
+  # host path.
+  if [[ -n ${AGENT_DATA_HOME:-} ]]; then
+    printf -- '--setenv\nXDG_DATA_HOME\n%s\n' "$AGENT_DATA_HOME"
+  fi
+
+  local e
+  for e in "${ENVX[@]}"; do
+    printf -- '--setenv\n%s\n%s\n' "${e%%=*}" "${e#*=}"
+  done
+
+  [[ $UNSHARE_PID == on ]] && printf -- '--unshare-pid\n'
+  [[ $UNSHARE_IPC == on ]] && printf -- '--unshare-ipc\n'
+  [[ $UNSHARE_UTS == on ]] && printf -- '--unshare-uts\n'
+  [[ $NETWORK == off ]]    && printf -- '--unshare-net\n'
+
+  printf -- '--unshare-cgroup-try\n--die-with-parent\n'
+  # --new-session detaches from the controlling terminal, which is what stops a
+  # sandboxed agent from injecting keystrokes into the parent shell. It also
+  # costs job control: the interactive shell then reports "cannot set terminal
+  # process group" and "no job control in this shell". That trade is right for
+  # `run`, where the command should not drive the terminal, and wrong for
+  # `shell`, whose whole purpose is an interactive login. INTERACTIVE is set by
+  # cmd_shell.
+  [[ $INTERACTIVE == 1 ]] || printf -- '--new-session\n'
+  printf -- '--\n'
+  printf '%s\n' "$@"
+}
+
+resolve_project() {
+  local raw="$1" p
+  [[ -n $raw ]] || die "no project directory given"
+  [[ -d $raw ]] || die "project directory does not exist: $raw"
+  p="$(realpath -- "$raw")" || die "cannot resolve: $raw"
+  printf '%s' "$p"
+}
+
+# The host's /etc/resolv.conf points at systemd-resolved's stub on 127.0.0.53,
+# which listens on host loopback and is therefore unreachable inside the
+# sandbox. Copy the non-stub resolver file to a temp location and bind that
+# over /etc/resolv.conf. Without this, DNS fails and no network tool works.
+prepare_resolv() {
+  RESOLV_TMP=""
+  local src=/run/systemd/resolve/resolv.conf
+  [[ -r $src ]] || return 0
+  grep -q '^nameserver' "$src" || return 0
+  RESOLV_TMP="$(mktemp /tmp/sbx-resolv.XXXXXX)"
+  cat "$src" >"$RESOLV_TMP"
+}
+
+cleanup() {
+  [[ -n ${RESOLV_TMP:-} && -f ${RESOLV_TMP:-} ]] && rm -f "$RESOLV_TMP"
+  [[ -n ${AGENT_DATA_TMP:-} && -d ${AGENT_DATA_TMP:-} ]] && rm -rf "$AGENT_DATA_TMP"
+  return 0
+}
+
+# ---------------------------------------------------------------- commands
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  sbx run [--agent] <dir> -- <command> [args...]
+  sbx shell [--agent] <dir>
+  sbx check [--agent] <dir>
+  sbx version
+
+The directory <dir> is the only writable host path. Everything else the
+sandbox writes is discarded on exit.
+
+  --agent   also mount the agent's own config and skills, and give it a
+            writable session copy of its data dir. The mounted config holds
+            live API credentials: pass this only for code you trust.
+EOF
+  exit 2
+}
+
+cmd_check() {
+  # `check <dir>` describes what `run` would exec. `check --shell <dir>`
+  # describes `shell` instead, which differs: it drops --new-session to keep
+  # job control, so the two plans are not interchangeable. The flag must be
+  # consumed before resolve_project, which takes the first argument as the dir.
+  local shell_mode=0
+  if [[ ${1:-} == --shell ]]; then
+    shell_mode=1
+    shift
+  fi
+  local project; project="$(resolve_project "${1:-}")"
+  local -a tail_args=()
+  if [[ $shell_mode == 1 ]]; then
+    INTERACTIVE=1
+    tail_args=(-- "${SHELL:-/bin/bash}" -i)
+  fi
+  local -a argv=()
+  while IFS= read -r l; do argv+=("$l"); done < <(build_argv "$project" "${tail_args[@]}")
+  local i
+  for ((i = 0; i < ${#argv[@]}; i++)); do
+    printf '%q' "${argv[i]}"
+    printf ' '
+  done
+  printf '\n'
+}
+
+# Crush run without its config fails deep inside its own API client with an
+# opaque error, and the cause (the default spec hides ~/.config/crush) is not
+# visible from the message. Say so up front instead of letting the user debug
+# a Go unmarshal error. Purely informational: never changes the mount plan.
+hint_agent_config() {
+  local name="${1##*/}"
+  [[ $name == crush ]] || return 0
+  [[ -z ${RO_FILE[*]:-}${RO_DIR[*]:-} ]] || return 0
+  warn "no config bound into the sandbox; Crush will fail to authenticate."
+  warn "re-run with --agent to mount its config and skills:"
+  warn "  sbx run --agent <dir> -- crush"
+}
+
+# Pull the --agent flag out of the argument list and stash the rest. Bash cannot
+# return an array from a function, so this rewrites the global CMD_ARGS in place.
+# Only the literal flag is recognised, and only before the `--` separator, so a
+# command that wants its own --agent argument can still receive one.
+CMD_ARGS=()
+split_flags() {
+  CMD_ARGS=()
+  local a past_sep=0
+  for a in "$@"; do
+    if [[ $a == -- ]]; then past_sep=1; fi
+    if [[ $past_sep == 0 && $a == --agent ]]; then
+      AGENT_PROFILE=1
+    else
+      CMD_ARGS+=("$a")
+    fi
+  done
+}
+
+# Add the agent profile on top of whatever the spec already provides. The
+# arrays are globals by design, matching parse_conf. Paths that are absent are
+# skipped silently here; any secret is reported by --agent's own notice.
+enable_agent_profile() {
+  [[ $AGENT_PROFILE == 1 ]] || return 0
+  local f d
+  for f in "${AGENT_RO_FILE[@]}"; do
+    [[ -f $f ]] || continue
+    RO_FILE+=("$f")
+  done
+  for d in "${AGENT_RO_DIR[@]}"; do
+    [[ -d $d ]] || continue
+    RO_DIR+=("$d")
+  done
+}
+
+cmd_run() {
+  local project; project="$(resolve_project "${1:-}")"
+  shift || true
+  [[ ${1:-} == -- ]] && shift
+  [[ $# -gt 0 ]] || die "no command given"
+  [[ $AGENT_PROFILE == 1 ]] || hint_agent_config "$@"
+  local -a argv=()
+  while IFS= read -r l; do argv+=("$l"); done < <(build_argv "$project" "$@")
+  # Do NOT exec. `exec` replaces this shell, so the EXIT trap never runs and the
+  # session copy of Crush's data dir, which holds live API keys, would be left
+  # in /tmp indefinitely. Run bwrap as a child, wait, then clean up and pass the
+  # exit status through unchanged. `--die-with-parent` still guarantees the
+  # sandbox dies if this wrapper is killed.
+  "${argv[@]}"
+  local rc=$?
+  cleanup
+  exit "$rc"
+}
+
+cmd_shell() {
+  local project; project="$(resolve_project "${1:-}")"
+  INTERACTIVE=1
+  cmd_run "$project" -- "${SHELL:-/bin/bash}" -i
+}
+
+main() {
+  command -v "$BWRAP" >/dev/null 2>&1 ||
+    die "bwrap not found; install bubblewrap (Fedora: dnf install bubblewrap)"
+  trap cleanup EXIT
+  split_flags "$@"
+  set -- "${CMD_ARGS[@]}"
+  parse_conf "$SBX_CONF"
+  prepare_resolv
+  sweep_stale_agent_data
+  prepare_agent_data
+  enable_agent_profile
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    run)     cmd_run "$@" ;;
+    shell)   cmd_shell "$@" ;;
+    check)   cmd_check "$@" ;;
+    version) printf 'sbx 0.1.0\n' ;;
+    *)       usage ;;
+  esac
+}
+
+main "$@"
